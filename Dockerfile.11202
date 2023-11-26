@@ -1,0 +1,126 @@
+#
+# Since: January, 2021
+# Author: gvenzl
+# Name: Dockerfile.11202
+# Description: Dockerfile to build Oracle DB XE 11.2.0.2.
+#              The Dockerfile supports building different flavors of images.
+#              These flavors can be controlled via the build argument "BUILD_MODE" which
+#              supports three modes, as follows:
+#
+#    FULL:     No database functionality is removed, just log and trace files from the
+#              database installation  itself.
+#              Additional required packages, such as 'gcc' and 'make' are installed
+#              (needed for native PL/SQL execution, etc.)
+#              Database configuration is as per default installation, except for the
+#              location of the fast_recovery_area and redo logs.
+#
+#    REGULAR:  Following functionalities have been removed:
+#              * gcc & make (needed for native PL/SQL execution, etc.)
+#              * APEX
+#
+#    SLIM:     Following functionalities have been removed:
+#              * Everything that has been removed in the REGULAR image, plus:
+#              * Oracle Text
+#
+# Copyright 2021 Gerald Venzl
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+FROM oraclelinux:8-slim as builder
+
+ARG BUILD_MODE
+
+ENV ORACLE_BASE=/u01/app/oracle \
+    ORACLE_BASE_CONFIG=/u01/app/oracle/product/11.2.0/xe \
+    ORACLE_BASE_HOME=/u01/app/oracle/product/11.2.0/xe \
+    ORACLE_HOME=/u01/app/oracle/product/11.2.0/xe \
+    ORACLE_SID=XE \
+    PATH=${PATH}:/u01/app/oracle/product/11.2.0/xe/bin:/u01/app/oracle \
+    NLS_LANG=.AL32UTF8
+
+COPY oracle-xe-11.2.0-1.0.x86_64.rpm xe.11202.rsp install.11202.sh container-entrypoint.sh resetPassword createAppUser healthcheck.sh /install/
+
+RUN /install/install.11202.sh "${BUILD_MODE}"
+
+##########################################################################################
+### Layer 1 --> Core OS
+##########################################################################################
+
+FROM scratch as os_layer
+
+# Redefine environment variables, etc. as we copied everything from an empty image (scratch)
+ENV ORACLE_BASE=/u01/app/oracle \
+    ORACLE_BASE_CONFIG=/u01/app/oracle/product/11.2.0/xe \
+    ORACLE_BASE_HOME=/u01/app/oracle/product/11.2.0/xe \
+    ORACLE_HOME=/u01/app/oracle/product/11.2.0/xe \
+    ORACLE_SID=XE \
+    PATH=${PATH}:/u01/app/oracle/product/11.2.0/xe/bin:/u01/app/oracle \
+    NLS_LANG=.AL32UTF8
+
+COPY --from=builder / /
+RUN rm -rf "${ORACLE_BASE}"
+
+##########################################################################################
+### Layer 2 --> Oracle Home without bin/oracle, lib, rdbms, and "${ORACLE_SID}".7z
+##########################################################################################
+
+FROM os_layer as oracle_home
+
+COPY --from=builder --chown=oracle:dba "${ORACLE_BASE}" "${ORACLE_BASE}"
+
+RUN rm    "${ORACLE_HOME}"/bin/oracle
+RUN rm -r "${ORACLE_HOME}"/lib
+RUN rm -r "${ORACLE_HOME}"/rdbms
+RUN rm    "${ORACLE_BASE}"/"${ORACLE_SID}".7z
+
+
+##########################################################################################
+### Layer 3 --> Oracle binary (bin/oracle)
+##########################################################################################
+
+FROM oracle_home as oracle_binary
+
+COPY --from=builder --chown=oracle:dba "${ORACLE_HOME}"/bin/oracle "${ORACLE_HOME}"/bin/oracle
+
+##########################################################################################
+### Layer 4 --> Oracle lib
+##########################################################################################
+
+FROM oracle_binary as oracle_lib
+
+COPY --from=builder --chown=oracle:dba "${ORACLE_HOME}"/lib "${ORACLE_HOME}"/lib
+
+##########################################################################################
+### Layer 5 --> Oracle lib
+##########################################################################################
+
+FROM oracle_lib as oracle_rdbms
+
+COPY --from=builder --chown=oracle:dba "${ORACLE_HOME}"/rdbms "${ORACLE_HOME}"/rdbms
+
+##########################################################################################
+### Layer 6 --> Oracle (compressed) db files
+##########################################################################################
+
+FROM oracle_rdbms as db_files
+
+COPY --from=builder --chown=oracle:dba "${ORACLE_BASE}"/"${ORACLE_SID}".7z  "${ORACLE_BASE}"/
+
+LABEL org.opencontainers.image.source https://github.com/gvenzl/oci-oracle-xe
+
+USER oracle
+WORKDIR ${ORACLE_BASE}
+
+HEALTHCHECK CMD "${ORACLE_BASE}"/healthcheck.sh >/dev/null || exit 1
+
+ENTRYPOINT ["container-entrypoint.sh"]
